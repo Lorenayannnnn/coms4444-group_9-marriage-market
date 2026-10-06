@@ -176,7 +176,7 @@ class Visualizer:
 			self.advance()
 
 	def type_key(self, key: int, unicode: str) -> None:
-		if unicode.isdigit() and len(self.goto_buffer) < 6:
+		if unicode in '0123456789' and len(unicode) == 1 and len(self.goto_buffer) < 6:
 			self.goto_buffer += unicode
 		elif key == pygame.K_BACKSPACE:
 			self.goto_buffer = self.goto_buffer[:-1]

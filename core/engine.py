@@ -1,3 +1,4 @@
+import math
 import random
 import uuid
 from collections.abc import Callable
@@ -157,6 +158,10 @@ class Engine:
 			raise ValueError(f'm must lie between 0 and d ({dims}), got {monotonic}.')
 		if rounds < 1:
 			raise ValueError('t must be at least 1.')
+		if not math.isfinite(bonus):
+			raise ValueError('B must be finite.')
+		if not math.isfinite(timeout) or timeout < 0:
+			raise ValueError('timeout must be finite and nonnegative.')
 
 		if isinstance(distribution, str):
 			self.distribution_name = distribution

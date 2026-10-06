@@ -69,6 +69,8 @@ def validate_distribution(rows: object, dims: int) -> Distribution:
 	for i, row in enumerate(table):
 		if len(row) != len(VALUES):
 			raise ValueError(f'P[{i}] must have {len(VALUES)} entries (values 0-10)')
+		if any(not math.isfinite(p) for p in row):
+			raise ValueError(f'P[{i}] probabilities must be finite')
 		if any(p < 0 for p in row):
 			raise ValueError(f'P[{i}] has a negative probability')
 		if abs(sum(row) - 1.0) > SUM_TOLERANCE:

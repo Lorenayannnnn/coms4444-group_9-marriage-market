@@ -1,3 +1,4 @@
+import csv
 import json
 import random
 
@@ -41,3 +42,40 @@ def test_finish_is_idempotent(tmp_path):
 	log.finish(engine)
 	log.finish(engine)
 	log.close()
+
+
+def test_csv_dates_and_results_match_engine(tmp_path):
+	random.seed(1)
+	engine = Engine([GreedyPlayer] * 6, rounds=10, bonus=1000, seed=2, timeout=0)
+	log = RunLog.create(str(tmp_path / 'run.log'), engine)
+	results = engine.run(on_round=bind(log, engine))
+	log.finish(engine)
+	with log.csv_path.open(encoding='utf-8-sig', newline='') as stream:
+		rows = list(csv.DictReader(stream))
+	assert len([r for r in rows if r['event'] == 'person']) == 6
+	dates = [r for r in rows if r['event'] == 'date']
+	assert len(dates) == sum(len(r.dates) * 2 for r in engine.records)
+	for row in dates:
+		person = int(row['person'])
+		record = engine.records[int(row['round']) - 1]
+		date = next(d for d in record.dates if person in (d.a, d.b))
+		assert row['proposed'] == str(date.decisions[person].propose)
+		assert tuple(int(row[f'projected_{i}']) for i in range(engine.dims)) == date.shown[person]
+	for row in (r for r in rows if r['event'] == 'result'):
+		person = results['players'][int(row['person'])]
+		assert float(row['happiness']) == person['happiness']
+		assert row['married'] == str(person['married'])
+		assert row['B'] == '1000.0'
+
+
+def test_csv_preserves_partial_run_without_records(tmp_path):
+	engine = Engine([GreedyPlayer] * 2, rounds=20, timeout=0, keep_records=False)
+	log = RunLog.create(str(tmp_path / 'partial.log'), engine)
+	bind(log, engine)(engine.step())
+	log.finish(engine)
+	log.finish(engine)
+	with log.csv_path.open(encoding='utf-8-sig', newline='') as stream:
+		rows = list(csv.DictReader(stream))
+	assert len([r for r in rows if r['event'] == 'date']) == 2
+	assert len([r for r in rows if r['event'] == 'result']) == 2
+	assert engine.records == []

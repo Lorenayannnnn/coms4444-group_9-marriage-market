@@ -2,8 +2,7 @@
 
 The engine never opens a file. ``main.py`` constructs a ``RunLog`` and hands
 ``record_round`` to ``Engine.run`` / the visualiser as an ``on_round``
-callback, so sweeps and the tournament - which never go through ``main.py`` -
-stay silent.
+callback, so sweeps - which never go through ``main.py`` - stay silent.
 
 Written incrementally, one round at a time, so a crash or a GUI quit still
 leaves everything that did run. The log is a post-hoc view of the run,
@@ -11,6 +10,7 @@ including everybody's true profile: it is for reading after the fact, not a
 new channel into player code.
 """
 
+import csv
 import json
 from collections.abc import Callable
 from datetime import datetime
@@ -24,7 +24,7 @@ DEFAULT_DIR = Path('logs')
 
 
 def default_path(seed: int) -> Path:
-	stamp = datetime.now().strftime('%Y%m%d-%H%M%S')
+	stamp = datetime.now().strftime('%Y%m%d-%H%M%S-%f')
 	return DEFAULT_DIR / f'marriage-{stamp}-seed{seed}.log'
 
 
@@ -54,6 +54,13 @@ class RunLog:
 		self.path = path
 		self._stream = stream
 		self._closed = False
+		self.csv_path = (
+			path.with_suffix('.csv')
+			if path.suffix != '.csv'
+			else path.with_name(path.stem + '-events.csv')
+		)
+		self._csv_stream = self.csv_path.open('w', encoding='utf-8-sig', newline='')
+		self._csv = None
 
 	@classmethod
 	def create(cls, path: str, engine: Engine) -> 'RunLog':
@@ -62,7 +69,91 @@ class RunLog:
 		stream = target.open('w', encoding='utf-8')
 		log = cls(target, stream)
 		log._write_header(engine)
+		log._start_csv(engine)
 		return log
+
+	def _start_csv(self, engine: Engine) -> None:
+		fields = [
+			'event',
+			'round',
+			'person',
+			'player',
+			'partner',
+			'pairing',
+			'date_number',
+			'interested_in',
+			'again_requested',
+			'proposed',
+			'incompatible',
+			'mutual_again',
+			'married',
+			'happiness',
+			'own_decrement',
+			'partner_decrement',
+			'fault',
+			'own_ad_dim',
+			'own_ad_value',
+			'seek_ad_dim',
+			'seek_ad_value',
+			'seed',
+			'N',
+			'd',
+			'm',
+			't',
+			'B',
+			'distribution',
+		]
+		fields += [
+			f'{name}_{i}'
+			for name in (
+				'true',
+				'ideal',
+				'projected',
+				'observed',
+				'stated_ideal',
+				'partner_stated_ideal',
+			)
+			for i in range(engine.dims)
+		]
+		self._csv = csv.DictWriter(self._csv_stream, fieldnames=fields)
+		self._csv.writeheader()
+		self._parameters = dict(
+			seed=engine.seed,
+			N=engine.people,
+			d=engine.dims,
+			m=engine.monotonic,
+			t=engine.rounds,
+			B=engine.bonus,
+			distribution=engine.distribution_name,
+		)
+		for i in range(engine.people):
+			ad = engine.ads[i]
+			self._csv_row(
+				engine,
+				'person',
+				0,
+				i,
+				own_ad_dim=ad.own_dim,
+				own_ad_value=ad.own_value,
+				seek_ad_dim=ad.seek_dim,
+				seek_ad_value=ad.seek_value,
+			)
+		for fault in engine.results()['faults']:
+			self._csv_row(engine, 'fault', 0, fault=fault)
+
+	def _csv_row(
+		self, engine: Engine, event: str, round_no: int, person: int | None = None, **values
+	) -> None:
+		row = dict(self._parameters, event=event, round=round_no, **values)
+		if person is not None:
+			row.update(person=person, player=engine.player_names[person])
+			for name, profile in (
+				('true', engine.profiles[person]),
+				('ideal', engine.ideals[person]),
+			):
+				row.update({f'{name}_{i}': value for i, value in enumerate(profile)})
+		self._csv.writerow(row)
+		self._csv_stream.flush()
 
 	def _write(self, text: str) -> None:
 		self._stream.write(text)
@@ -108,18 +199,59 @@ class RunLog:
 			lines.append(f'  FAULT {fault}')
 		self._write('\n'.join(lines))
 		self._write('')
+		for person, chosen in sorted(record.interest.items()):
+			self._csv_row(engine, 'interest', record.round, person, interested_in=_join(chosen))
+		for date in record.dates:
+			for person, partner in ((date.a, date.b), (date.b, date.a)):
+				decision = date.decisions[person]
+				values = dict(
+					partner=partner,
+					pairing=date.how,
+					date_number=date.number,
+					again_requested=decision.again,
+					proposed=decision.propose,
+					incompatible=decision.incompatible,
+					mutual_again=date.again,
+					married=date.married,
+				)
+				for name, profile in (
+					('projected', date.shown[person]),
+					('observed', date.shown[partner]),
+					('stated_ideal', date.stated[person]),
+					('partner_stated_ideal', date.stated[partner]),
+				):
+					values.update({f'{name}_{i}': value for i, value in enumerate(profile)})
+				self._csv_row(engine, 'date', record.round, person, **values)
+		for person in record.unmatched:
+			self._csv_row(engine, 'unmatched', record.round, person)
+		for fault in record.faults:
+			self._csv_row(engine, 'fault', record.round, fault=fault)
 
 	def finish(self, engine: Engine) -> None:
 		if self._closed:
 			return
 		self._write(f'======== snapshot after round {engine.round} / {engine.rounds} ========')
 		self._write(json.dumps(engine.results(), indent=2))
+		for person in engine.results()['players']:
+			self._csv_row(
+				engine,
+				'result',
+				engine.round,
+				person['index'],
+				partner=person['partner'],
+				married=person['married'],
+				happiness=person['happiness'],
+				own_decrement=person['own_decrement'],
+				partner_decrement=person['partner_decrement'],
+			)
 		self._stream.close()
+		self._csv_stream.close()
 		self._closed = True
 
 	def close(self) -> None:
 		if not self._closed:
 			self._stream.close()
+			self._csv_stream.close()
 			self._closed = True
 
 

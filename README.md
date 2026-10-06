@@ -78,14 +78,21 @@ every date (what each side projected, the ideal each side described, and
 what each decided), marriages, and faults. It ends with a JSON snapshot of the
 results.
 
-## Sweeps and the tournament
+Each debug log also writes a CSV beside it (for example, `logs/demo.log`
+and `logs/demo.csv`). Open the CSV in Excel or Google Sheets and filter the
+`event` column: `person` gives initial profiles and ads, `interest` gives
+date requests, `date` gives one row per participant per date, `unmatched`
+and `fault` explain missed dates and invalid moves, and `result` gives each
+person's final score. Profile dimensions are separate numeric columns.
+CSV logs also work in the GUI, when quitting early, and with `--summary-only`.
+`--no-log` disables both files. True profiles in logs are for debugging;
+player code must not read them.
+
+## Parameter sweeps
 
 ```
 uv run sweep.py configs/bonus_sweep.json
 uv run sweep.py configs/distribution_comparison.json --rounds 50 --seeds 1 2 3
-uv run tournament.py configs/tournament.json
-uv run tournament.py configs/tournament.json --rank-by mean_happiness --live
-uv run tournament.py configs/tournament.json --gui
 ```
 
 A sweep runs each configuration in a config file over a set of seeds. It
@@ -93,13 +100,6 @@ prints mean happiness, the share of people with positive happiness, the share
 who married, and the average round they married on. Full JSON and CSV output
 goes to `results/`. `configs/bonus_sweep.json` is the handout's "if B is very
 high, what will happen?" question.
-
-The tournament ranks groups across many markets. Each group gets a market
-where it holds every seat, a half-and-half market with every other group,
-and (with three or more groups) one market with everybody mixed in. There is
-no scoring rule inside a single run. Groups are ranked by the share of their
-seats that ended with positive happiness (the primary goal), with mean
-happiness (the secondary goal) as the tie-break.
 
 ## Writing a player
 
@@ -197,8 +197,8 @@ The happiness arithmetic is importable too, from `models.profile`
   forfeit that move. The limit is enforced with `SIGALRM`, which is Unix-only
   and main-thread-only. On Windows there is no alarm to set, so `--timeout`
   is a no-op and a slow player runs to completion rather than being cut off.
-  Your code still has to finish quickly, because the tournament runs on Unix,
-  where the limit is real. `--timeout 0` disables it everywhere.
+  On Unix, your code must finish within the limit. `--timeout 0` disables it
+  everywhere.
 - **Validity.** Profiles must be exactly d plain `int`s in 0-10. `numpy`
   integers are rejected, and the fault names the type. Decision flags must be
   real `bool`s. A proposal before the second date, or `incompatible`

@@ -117,6 +117,61 @@ def test_on_round_sees_every_round():
 	assert seen == list(range(1, 8))
 
 
+def test_skip_input_ignores_nondecimal_digits():
+	view = Visualizer(build())
+	view.type_key(0, '²')
+	view.type_key(pygame.K_RETURN, '\r')
+	assert view.engine.round == 0
+	assert view.goto_buffer == ''
+
+
+def test_skip_input_backspace_and_length_limit():
+	view = Visualizer(build())
+	for digit in '1234567':
+		view.type_key(0, digit)
+	assert view.goto_buffer == '123456'
+	view.type_key(pygame.K_BACKSPACE, '')
+	assert view.goto_buffer == '12345'
+
+
+@pytest.mark.parametrize('quit_key', [pygame.K_q, pygame.K_ESCAPE, None])
+def test_real_event_loop_controls_and_partial_log(tmp_path, monkeypatch, quit_key):
+	import json
+
+	from core.runlog import RunLog, bind
+	from ui.gui import run_gui
+
+	engine = build(rounds=20)
+	path = tmp_path / 'gui.log'
+	log = RunLog.create(str(path), engine)
+
+	def key(k, u=''):
+		return pygame.event.Event(pygame.KEYDOWN, key=k, unicode=u)
+
+	closing = pygame.event.Event(pygame.QUIT) if quit_key is None else key(quit_key)
+	frames = iter(
+		[
+			[
+				key(pygame.K_RIGHT),
+				key(pygame.K_UP),
+				key(pygame.K_DOWN),
+				pygame.event.Event(pygame.MOUSEBUTTONDOWN, button=1, pos=(100, 100)),
+			],
+			[key(pygame.K_3, '3'), key(pygame.K_RETURN, '\r')],
+			[key(pygame.K_SPACE)],
+			[closing],
+		]
+	)
+	monkeypatch.setattr(pygame.event, 'get', lambda: next(frames, [closing]))
+	run_gui(engine, on_round=bind(log, engine))
+	log.finish(engine)
+	assert engine.round == 3
+	text = path.read_text()
+	assert text.count('\nround ') == 3
+	assert json.loads(text.split('========\n', 1)[1]) == engine.results()
+	assert not pygame.get_init()
+
+
 def test_leaderboard_draws_and_closes():
 	from ui.leaderboard import Leaderboard
 

@@ -40,6 +40,7 @@ def _open_log(args, engine):
 		print(f'warning: could not write log - {exc}', file=sys.stderr)
 		return None
 	print(f'log: {log.path}', file=sys.stderr)
+	print(f'csv: {log.csv_path}', file=sys.stderr)
 	return log
 
 

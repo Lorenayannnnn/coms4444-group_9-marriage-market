@@ -72,7 +72,7 @@ def settings(argv: list[str] | None = None) -> Settings:
 		default='',
 		metavar='PATH',
 		help='Write a per-round debug log (default: logs/marriage-*.log). Pass a path to '
-		'choose the file. Sweeps and the tournament do not write one.',
+		'choose the file. Sweeps do not write one.',
 	)
 	parser.add_argument(
 		'--no-log',
