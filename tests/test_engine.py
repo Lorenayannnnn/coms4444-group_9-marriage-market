@@ -255,12 +255,12 @@ def test_results_are_consistent():
 			assert p['own_decrement'] is None
 
 
-def test_greedy_beats_random_on_the_default_market():
-	random.seed(9)
-	results = build([GreedyPlayer] * 10 + [RandomPlayer] * 10, rounds=100, seed=4444).run()
+def test_greedy_beats_random_on_average_across_markets():
 	by_name: dict[str, list[float]] = {}
-	for p in results['players']:
-		by_name.setdefault(p['name'], []).append(p['happiness'])
-	greedy = sum(by_name['GreedyPlayer']) / 10
-	rand = sum(by_name['RandomPlayer']) / 10
+	for seed in range(20):
+		results = build([GreedyPlayer] * 10 + [RandomPlayer] * 10, rounds=100, seed=seed).run()
+		for p in results['players']:
+			by_name.setdefault(p['name'], []).append(p['happiness'])
+	greedy = sum(by_name['GreedyPlayer']) / len(by_name['GreedyPlayer'])
+	rand = sum(by_name['RandomPlayer']) / len(by_name['RandomPlayer'])
 	assert greedy > rand

@@ -220,7 +220,10 @@ class Engine:
 		self.player_names: list[str] = []
 		for i, cls in enumerate(players):
 			snapshot = PlayerSnapshot(
-				id=uuid.uuid4(), index=i, profile=self.profiles[i], ideal=self.ideals[i]
+				id=uuid.uuid5(uuid.NAMESPACE_OID, f'marriage-market:{seed}:{i}'),
+				index=i,
+				profile=self.profiles[i],
+				ideal=self.ideals[i],
 			)
 			name = getattr(cls, '__name__', 'player')
 			try:

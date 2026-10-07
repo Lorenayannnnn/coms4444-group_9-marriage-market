@@ -1,3 +1,4 @@
+import random
 import uuid
 from abc import ABC, abstractmethod
 from collections.abc import Iterable
@@ -126,6 +127,8 @@ class DateOutcome:
 class Player(ABC):
 	def __init__(self, snapshot: PlayerSnapshot, ctx: GameContext) -> None:
 		self.id = snapshot.id
+		# A private random stream per person; never use the engine's pairing RNG.
+		self.rng = random.Random(snapshot.id.int)
 		self.index = snapshot.index
 		self.name = type(self).__name__
 		self.profile = snapshot.profile

@@ -46,6 +46,18 @@ The presets for P are:
 A `--dist-file` is either a bare list of d rows, or `{"P": [...]}`. Each row
 has 11 probabilities, for values 0 through 10, and must sum to 1.
 
+With the same parameters, seed, roster order, and player code, the built-in
+players produce identical results and log contents. Each player has its own
+seeded `self.rng`; use `self.rng.random()`, `self.rng.choice(...)`, or
+`self.rng.shuffle(...)` for random decisions. The simulation seed and P are
+not provided through the player interface. Player IDs are repeatable too.
+Log filenames still include a timestamp. GUI speed and pauses do not change
+results if you advance to the same round.
+
+Student players must use `self.rng` and avoid external randomness, clocks,
+and shared state for reproducibility. Wall-clock timeouts can vary with
+machine load; `--timeout 0` removes that source of variation for trusted code.
+
 ## Visualizer
 
 ```

@@ -50,6 +50,7 @@ class PlayerTemplate(BasePlayer):
 		#   self.monotonic  m, the first m dimensions are monotonic
 		#   self.rounds     t, how many rounds of dating there are
 		#   self.bonus      B, the marriage bonus
+		#   self.rng        private seeded random generator; use instead of random
 		#
 		# The engine constructs you once, before round 1. Anything you want to
 		# carry between rounds lives on self, so initialise it here.

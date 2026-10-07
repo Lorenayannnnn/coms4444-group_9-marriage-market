@@ -1,5 +1,3 @@
-import random
-
 from models.player import (
 	Advertisement,
 	Candidate,
@@ -24,15 +22,15 @@ class RandomPlayer(BasePlayer):
 
 	def advertise(self) -> Advertisement:
 		return Advertisement(
-			own_dim=random.randrange(self.dims),
-			own_value=random.randint(MIN_VALUE, MAX_VALUE),
-			seek_dim=random.randrange(self.dims),
-			seek_value=random.randint(MIN_VALUE, MAX_VALUE),
+			own_dim=self.rng.randrange(self.dims),
+			own_value=self.rng.randint(MIN_VALUE, MAX_VALUE),
+			seek_dim=self.rng.randrange(self.dims),
+			seek_value=self.rng.randint(MIN_VALUE, MAX_VALUE),
 		)
 
 	def choose_dates(self, candidates: tuple[Candidate, ...], turn: RoundContext) -> list[int]:
-		return [c.index for c in candidates if random.random() < 0.5]
+		return [c.index for c in candidates if self.rng.random() < 0.5]
 
 	def decide(self, date: DateContext, observed: Profile, stated_ideal: Profile) -> Decision:
-		propose = date.date_number >= 2 and random.random() < 0.25
-		return Decision(again=random.random() < 0.5, propose=propose)
+		propose = date.date_number >= 2 and self.rng.random() < 0.25
+		return Decision(again=self.rng.random() < 0.5, propose=propose)

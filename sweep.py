@@ -198,9 +198,8 @@ def _run_one(job: dict) -> dict:
 	for code, count in job['players']:
 		roster.extend([available[code]] * count)
 
-	# RandomPlayer draws from the global `random` module rather than the
-	# engine's rng, so without this the same seed gives different answers in
-	# every process.
+	# Seed global random as a compatibility aid for older student players;
+	# new players should use their private self.rng.
 	random.seed(job['seed'])
 
 	results = Engine(
