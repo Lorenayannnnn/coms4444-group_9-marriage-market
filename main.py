@@ -52,18 +52,35 @@ def main() -> None:
 	if args.dist_file:
 		distribution = load_distribution(args.dist_file, args.dims)
 
+	options = dict(
+		players=roster,
+		rounds=args.rounds,
+		bonus=args.bonus,
+		dims=args.dims,
+		monotonic=args.monotonic,
+		seed=args.seed,
+		distribution=distribution,
+		timeout=args.timeout,
+		keep_records=not args.summary_only,
+		list_multiple=args.list_multiple,
+	)
+	if args.gui:
+		from core.gui_worker import SimulationWorker
+		from ui.gui import run_gui
+
+		# GUI only needs the latest display state; every round still reaches logs.
+		options['keep_records'] = False
+		worker = SimulationWorker(options, args.log)
+		try:
+			run_gui(worker=worker)
+		except RuntimeError as exc:
+			raise SystemExit(f'error: {exc}') from exc
+		finally:
+			worker.close()
+		return
+
 	try:
-		engine = Engine(
-			players=roster,
-			rounds=args.rounds,
-			bonus=args.bonus,
-			dims=args.dims,
-			monotonic=args.monotonic,
-			seed=args.seed,
-			distribution=distribution,
-			timeout=args.timeout,
-			keep_records=not args.summary_only,
-		)
+		engine = Engine(**options)
 	except ValueError as exc:
 		raise SystemExit(f'error: {exc}') from exc
 
@@ -75,12 +92,7 @@ def main() -> None:
 		on_round = bind(log, engine)
 
 	try:
-		if args.gui:
-			from ui.gui import run_gui
-
-			run_gui(engine, on_round=on_round)
-		else:
-			print(json.dumps(engine.run(on_round=on_round), indent=2))
+		print(json.dumps(engine.run(on_round=on_round), indent=2))
 	finally:
 		if log is not None:
 			log.finish(engine)

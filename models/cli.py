@@ -18,6 +18,7 @@ class Settings:
 	summary_only: bool
 	gui: bool
 	log: str | None
+	list_multiple: float = 4.0
 
 
 def settings(argv: list[str] | None = None) -> Settings:
@@ -54,6 +55,12 @@ def settings(argv: list[str] | None = None) -> Settings:
 		help='JSON file holding P as d rows of 11 probabilities. Overrides --dist.',
 	)
 	parser.add_argument('--seed', type=int, default=4444, help='Random seed.')
+	parser.add_argument(
+		'--list-multiple',
+		type=float,
+		default=4.0,
+		help='Limit returned interest lists to ceil(MULTIPLE * sqrt(N)), capped at N-1. All eligible candidates remain visible. Default 4; 0 disables the interest limit.',
+	)
 	parser.add_argument(
 		'--timeout',
 		type=float,
@@ -99,4 +106,5 @@ def settings(argv: list[str] | None = None) -> Settings:
 		summary_only=args.summary_only,
 		gui=args.gui,
 		log=None if args.no_log else args.log,
+		list_multiple=args.list_multiple,
 	)

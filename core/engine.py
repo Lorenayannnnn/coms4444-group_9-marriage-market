@@ -3,6 +3,7 @@ import random
 import uuid
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from itertools import islice
 from typing import Any
 
 from core.sandbox import PlayerFault, call_player
@@ -148,6 +149,7 @@ class Engine:
 		distribution: str | Distribution = 'mixed',
 		timeout: float = 1.0,
 		keep_records: bool = True,
+		list_multiple: float = 4.0,
 	) -> None:
 		people = len(players)
 		if people < 2 or people % 2:
@@ -162,6 +164,8 @@ class Engine:
 			raise ValueError('B must be finite.')
 		if not math.isfinite(timeout) or timeout < 0:
 			raise ValueError('timeout must be finite and nonnegative.')
+		if not math.isfinite(list_multiple) or list_multiple < 0:
+			raise ValueError('list_multiple must be finite and nonnegative.')
 
 		if isinstance(distribution, str):
 			self.distribution_name = distribution
@@ -171,6 +175,13 @@ class Engine:
 			self.distribution = validate_distribution(distribution, dims)
 
 		self.rng = random.Random(seed)
+		self.list_multiple = float(list_multiple)
+		scaled_limit = list_multiple * math.sqrt(people)
+		self.list_limit = (
+			(people - 1 if scaled_limit >= people - 1 else math.ceil(scaled_limit))
+			if list_multiple
+			else None
+		)
 		self.people = people
 		self.rounds = rounds
 		self.bonus = float(bonus)
@@ -212,6 +223,7 @@ class Engine:
 			monotonic=monotonic,
 			rounds=rounds,
 			bonus=self.bonus,
+			list_limit=self.list_limit,
 		)
 		# Construction runs inside the sandbox for the same reason moves do: a
 		# group whose __init__ raises or hangs must not take down every other
@@ -278,14 +290,22 @@ class Engine:
 		allowed = {c.index for c in candidates}
 
 		def ask() -> set[int]:
-			chosen = tuple(self.players[index].choose_dates(candidates, turn))
+			answer = self.players[index].choose_dates(candidates, turn)
+			chosen = (
+				tuple(islice(answer, self.list_limit + 1))
+				if self.list_limit is not None
+				else tuple(answer)
+			)
 			bad = _wrong_type(chosen)
 			if bad is not None:
 				raise PlayerFault(f'chosen people must be plain int indices, not {bad}')
-			stray = sorted(set(chosen) - allowed)
+			if self.list_limit is not None and len(chosen) > self.list_limit:
+				raise PlayerFault(f'interest list must contain at most {self.list_limit} entries')
+			chosen_set = set(chosen)
+			stray = sorted(chosen_set - allowed)
 			if stray:
 				raise PlayerFault(f"{stray} not among this round's candidates")
-			return set(chosen)
+			return chosen_set
 
 		return self.__ask(index, 'choose_dates', record.faults, set(), ask)
 
@@ -347,28 +367,6 @@ class Engine:
 	def singles(self) -> list[int]:
 		return [i for i in range(self.people) if self.spouse[i] is None]
 
-	def __greedy(
-		self, edges: list[tuple[int, int]], how: str, taken: set[int]
-	) -> list[tuple[int, int, str]]:
-		"""A random maximal matching over ``edges`` among people not yet taken.
-
-		Maximal is what keeps "a person having no dates for a round" rare: at
-		the random stage, anyone left over has been blocked from everyone else
-		left over, which is exactly the handout's exception.
-		"""
-		edges = [
-			(a, b) for a, b in edges if a not in taken and b not in taken and self.allowed(a, b)
-		]
-		self.rng.shuffle(edges)
-		pairs = []
-		for a, b in edges:
-			if a in taken or b in taken:
-				continue
-			taken.add(a)
-			taken.add(b)
-			pairs.append((a, b, how))
-		return pairs
-
 	def __match(self, singles: list[int], record: RoundRecord) -> list[tuple[int, int, str]]:
 		taken: set[int] = set()
 		pairs: list[tuple[int, int, str]] = []
@@ -383,24 +381,63 @@ class Engine:
 			round=self.round, rounds_left=self.rounds - self.round + 1, singles=len(singles)
 		)
 		interest: dict[int, set[int]] = {}
+		# Advertisements are fixed and Candidate is immutable. Fresh candidates
+		# can be shared across lists; only a person's own past dates need overrides.
+		fresh = {j: Candidate(index=j, ad=self.ads[j], dates=0) for j in pool}
+		pool_candidates = tuple(fresh.values())
+		history: dict[int, dict[int, int]] = {}
+		for (a, b), count in self.date_counts.items():
+			if a in fresh and b in fresh:
+				history.setdefault(a, {})[b] = count
+				history.setdefault(b, {})[a] = count
+		blocked_by: dict[int, set[int]] = {}
+		for a, b in self.blocked:
+			blocked_by.setdefault(a, set()).add(b)
 		for i in pool:
-			candidates = tuple(
-				Candidate(index=j, ad=self.ads[j], dates=self.dates_between(i, j))
-				for j in pool
-				if j != i and (i, j) not in self.blocked
-			)
+			past = history.get(i)
+			blocked = blocked_by.get(i)
+			if not past and not blocked:
+				candidates = tuple(c for c in pool_candidates if c.index != i)
+			else:
+				past = past or {}
+				blocked = blocked or set()
+				past_candidates = {j: Candidate(j, self.ads[j], count) for j, count in past.items()}
+				candidates = tuple(
+					past_candidates.get(c.index, c)
+					for c in pool_candidates
+					if c.index != i and c.index not in blocked
+				)
 			interest[i] = self.__choose(i, candidates, turn, record)
 		record.interest = {i: tuple(sorted(chosen)) for i, chosen in interest.items()}
 
-		mutual = sorted({(a, b) for a in pool for b in interest[a] if a < b and a in interest[b]})
-		pairs += self.__greedy(mutual, MUTUAL, taken)
+		# Visit players in random order, rather than building/sorting all edges.
+		# Each stage is maximal: a pair of players still unmatched at its end
+		# cannot have had an eligible edge when either endpoint was visited.
+		order = list(pool)
+		self.rng.shuffle(order)
+		for how in (MUTUAL, ONE_SIDED):
+			for a in order:
+				if a in taken:
+					continue
+				for b in interest[a]:
+					if b in taken or (how == MUTUAL and a not in interest[b]):
+						continue
+					if self.allowed(a, b):
+						taken.update((a, b))
+						pairs.append((*_key(a, b), how))
+						break
 
-		one_sided = sorted({_key(a, b) for a in pool for b in interest[a]})
-		pairs += self.__greedy(one_sided, ONE_SIDED, taken)
-
-		rest = [i for i in pool if i not in taken]
-		everyone = [(a, b) for k, a in enumerate(rest) for b in rest[k + 1 :]]
-		pairs += self.__greedy(everyone, RANDOM, taken)
+		rest = [i for i in order if i not in taken]
+		self.rng.shuffle(rest)
+		for position, a in enumerate(rest):
+			if a in taken:
+				continue
+			for k in range(position + 1, len(rest)):
+				b = rest[k]
+				if b not in taken and self.allowed(a, b):
+					taken.update((a, b))
+					pairs.append((*_key(a, b), RANDOM))
+					break
 
 		record.unmatched = [i for i in pool if i not in taken]
 		return pairs
@@ -589,6 +626,9 @@ class Engine:
 				'bonus': self.bonus,
 				'distribution': self.distribution_name,
 				'seed': self.seed,
+				'list_multiple': self.list_multiple,
+				'list_limit': self.list_limit,
+				'candidate_policy': 'all',
 			},
 			'rounds_played': self.round,
 			'married_people': len(married),

@@ -22,6 +22,7 @@ uv run main.py
 | `--dist` | `mixed` | Preset distribution P: `uniform`, `normal`, or `mixed`. |
 | `--dist-file PATH` | none | JSON file holding P as d rows of 11 probabilities (values 0-10). Overrides `--dist`. |
 | `--seed` | `4444` | Random seed, for repeatable runs. |
+| `--list-multiple` | `4` | Returned interest-list limit: ceil(multiple * sqrt(N)), capped at N-1. All eligible candidates stay visible. `0` disables the interest limit. |
 | `--timeout` | `1.0` | Per-call wall-clock budget for player code, in seconds. `0` disables. Relies on `SIGALRM`; a no-op on Windows. |
 | `--log PATH` | `logs/marriage-*.log` | Per-round debug log (interest lists, dates, decisions, marriages, faults). |
 | `--no-log` | off | Do not write a debug log. |
@@ -64,24 +65,52 @@ machine load; `--timeout 0` removes that source of variation for trusted code.
 uv run main.py --gui --player g 10 --player r 10
 ```
 
-Everybody sits on a ring, coloured by the group whose code runs them. Each
-round's dates are drawn as chords coloured by how the simulator paired them:
-repeat, mutual interest, one-sided interest, or random. A pink dot marks a
-proposal that was not returned. Married couples are joined in gold for the
-rest of the run. Click a person to see their true profile, ideal,
-advertisement, and dating history. That is engine truth, which no player ever
-sees. A player fault gets a red banner across the top of the window.
+The visualizer focuses on one participant at a time. Enter an ID in the
+**Participant ID** box and press Enter (or Show).
+One panel shows that person's status, happiness, profiles, advertisement,
+and dating history. Click a history row for a brief pairing/result explanation.
+Scroll to see older dates; Page Up/Down pages long profiles.
+These are engine-truth debugging views, not extra information given to players.
+
+The header shows only people, singles, married couples, and the current round.
+Happiness is explicit for every person, including zero for unmarried people.
+Final scores remain available for every ID after the run ends. Full projected
+profiles and scoring details remain available in the text and CSV logs.
 
 | Key | Action |
 | --- | --- |
 | `SPACE` | Play / pause |
 | `RIGHT` or `S` | Next round |
 | `UP` / `DOWN` | Faster / slower (1-32 rounds per second) |
-| Click | Select a person (click empty space to clear) |
+| `P` | Focus participant ID input; digits + Enter select |
+| `G` | Focus round input; digits + Enter skip forward |
+| `TAB` | Switch between the two inputs |
+| `PAGE UP` / `PAGE DOWN` | Page through profile dimensions |
+| Scroll / click history | Browse dates / select date details |
 | `Q` or `ESC` | Quit |
 
 The **Skip to round** box under the header is how you jump: type a round
-number and press Enter. It cannot rewind.
+number and press Enter. It cannot rewind. Press Space to cancel a forward
+jump; a round already in progress is allowed to finish.
+The worker computes all intervening rounds without displaying them, then
+shows the requested round (or the final round if everyone marries sooner).
+Skipped rounds are still recorded in the logs.
+
+GUI runs compute dates and write logs in a separate process, so controls and
+rendering stay responsive during expensive rounds. At most one round is in
+flight; repeated step presses while it is computing are ignored. Unchanged
+frames are reused instead of redrawing at 60 FPS. Playback
+speed is a target and may be lower when rounds take longer to compute.
+The worker retains Unix player timeouts and sends only the latest display
+state and the selected participant's history to the GUI. The worker retains
+compact per-person date histories, but not the large per-round interest lists.
+Matching rules and
+seeded outcomes are the same as terminal runs.
+
+Quitting closes the window immediately and gives an in-progress round up to
+five seconds to finish and finalize logs. If a worker is still unresponsive,
+it is terminated with a warning; completed, flushed round logs remain, but a
+final score snapshot may be absent.
 
 Every `main.py` run writes a debug log under `logs/`. Use `--log PATH` to
 choose the file or `--no-log` to skip it. The log starts with everyone's true
@@ -97,6 +126,7 @@ date requests, `date` gives one row per participant per date, `unmatched`
 and `fault` explain missed dates and invalid moves, and `result` gives each
 person's final score. Profile dimensions are separate numeric columns.
 CSV logs also work in the GUI, when quitting early, and with `--summary-only`.
+Text and CSV output are buffered and flushed once per completed round.
 `--no-log` disables both files. True profiles in logs are for debugging;
 player code must not read them.
 
@@ -151,7 +181,7 @@ from models.player import Player as BasePlayer, Decision
 
 class Player4(BasePlayer):
 	def choose_dates(self, candidates, turn):
-		return [c.index for c in candidates]
+		return [c.index for c in candidates[: self.list_limit]]
 
 	def decide(self, date, observed, stated_ideal):
 		return Decision(again=True, propose=date.date_number >= 2)
@@ -272,6 +302,37 @@ simulation and need not be true.
 A person who has marked someone incompatible is never paired with them again,
 in either direction. In rare cases this leaves a person without a date for a
 round.
+
+The engine assigns dates from the players' interest lists; compatibility
+scoring and preferences belong to player code. Immutable candidate information
+is reused within each round, with past-date counts supplied separately for
+each person. Later pairing stages consider only people not already assigned.
+Matching visits participants in seeded random order, first pairing mutually
+interested people greedily, then one-way interest, then any compatible
+remaining people. It does not construct or sort all possible pair lists.
+The mutual/one-way scans are O(N + M), where M is the total interest-list
+length. Candidate preparation, student code, and heavily blocked fallback
+pairing can still require quadratic work. Every player sees the full eligible
+candidate pool, excluding themselves, people already reserved for repeat
+dates, and people they marked incompatible. Previous dates remain selectable.
+Only the returned interest list is capped at `ceil(4 * sqrt(N))`, capped at
+N-1: 179 names for N=2,000 and 400 for N=10,000. Built-in players and the
+template respect this limit. RandomPlayer uniformly samples from its choices
+when necessary; GreedyPlayer returns its ranked choices up to the cap.
+
+Mutual repeat requests are assigned first. The interest cap changes outcomes,
+but no advertisements or eligible candidates are hidden by a random shortlist.
+Use `--list-multiple 0` to disable the interest cap, or a different positive
+multiple to adjust it. Sweeps accept `list_multiple`
+in defaults/cells/grids and `--list-multiple` on the command line.
+
+Player code receives the limit as `self.list_limit` (`None` when disabled).
+Only offered candidate IDs may be returned; overlong responses, including
+duplicates, forfeit that choice with a logged fault. The iterator is bounded
+so an endless response cannot grow the list indefinitely when caps are on.
+Text/CSV logs and JSON results include the multiple and cap for reproducibility.
+This vertex-order algorithm changes outcomes from older versions while
+remaining reproducible with the same parameters, seed, roster, and code.
 
 **Dates.** During a date each person projects a profile, which need not be
 their true one. Their date senses exactly that projection. At the end, each

@@ -70,6 +70,7 @@ class RunLog:
 		log = cls(target, stream)
 		log._write_header(engine)
 		log._start_csv(engine)
+		log.flush()
 		return log
 
 	def _start_csv(self, engine: Engine) -> None:
@@ -102,6 +103,9 @@ class RunLog:
 			't',
 			'B',
 			'distribution',
+			'list_multiple',
+			'list_limit',
+			'candidate_policy',
 		]
 		fields += [
 			f'{name}_{i}'
@@ -125,6 +129,9 @@ class RunLog:
 			t=engine.rounds,
 			B=engine.bonus,
 			distribution=engine.distribution_name,
+			list_multiple=engine.list_multiple,
+			list_limit=engine.list_limit,
+			candidate_policy='all',
 		)
 		for i in range(engine.people):
 			ad = engine.ads[i]
@@ -153,20 +160,23 @@ class RunLog:
 			):
 				row.update({f'{name}_{i}': value for i, value in enumerate(profile)})
 		self._csv.writerow(row)
-		self._csv_stream.flush()
 
 	def _write(self, text: str) -> None:
 		self._stream.write(text)
 		if not text.endswith('\n'):
 			self._stream.write('\n')
+
+	def flush(self) -> None:
+		"""Publish a complete header/round, rather than flushing every row."""
 		self._stream.flush()
+		self._csv_stream.flush()
 
 	def _write_header(self, engine: Engine) -> None:
 		self._write('marriage market debug log')
 		self._write(
 			f'seed={engine.seed}  N={engine.people}  d={engine.dims}  m={engine.monotonic}  '
 			f't={engine.rounds}  B={engine.bonus:g}  P={engine.distribution_name}  '
-			f'timeout={engine.timeout}'
+			f'timeout={engine.timeout}  list_multiple={engine.list_multiple:g}  list_limit={engine.list_limit}  candidates=all'
 		)
 		self._write('people:')
 		for i, name in enumerate(engine.player_names):
@@ -226,6 +236,7 @@ class RunLog:
 			self._csv_row(engine, 'unmatched', record.round, person)
 		for fault in record.faults:
 			self._csv_row(engine, 'fault', record.round, fault=fault)
+		self.flush()
 
 	def finish(self, engine: Engine) -> None:
 		if self._closed:

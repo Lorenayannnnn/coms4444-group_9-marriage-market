@@ -51,6 +51,7 @@ class PlayerTemplate(BasePlayer):
 		#   self.rounds     t, how many rounds of dating there are
 		#   self.bonus      B, the marriage bonus
 		#   self.rng        private seeded random generator; use instead of random
+		#   self.list_limit maximum returned names, or None if disabled
 		#
 		# The engine constructs you once, before round 1. Anything you want to
 		# carry between rounds lives on self, so initialise it here.
@@ -91,7 +92,7 @@ class PlayerTemplate(BasePlayer):
 		Nobody is ever paired with someone either side marked incompatible, so
 		in rare cases you sit a round out.
 		"""
-		return [c.index for c in candidates]
+		return [c.index for c in candidates[: self.list_limit]]
 
 	def project(self, date: DateContext) -> Profile:
 		"""The profile your behaviour projects on this date.

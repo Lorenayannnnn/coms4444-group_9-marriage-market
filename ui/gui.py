@@ -1,137 +1,462 @@
-"""Pygame visualiser for the marriage market.
+"""Participant-focused visualizer; player execution remains in the worker process."""
 
-Everybody sits on a ring, coloured by the group whose code runs them. Each
-round's dates are drawn as chords across the ring, coloured by how the
-simulator paired them, and married couples are joined in gold for the rest of
-the run. Click a person to see their true profile, their ideal and their
-advertisement - engine truth that no player ever gets to see.
-
-This module contains no game rules. It calls ``engine.step()`` once per round
-and renders the returned ``RoundRecord`` plus whatever is already on the
-engine. If something here needs a value the engine does not expose, the fix is
-to expose it on the engine, not to recompute it up here.
-"""
-
-import math
 from collections.abc import Callable
 
 import pygame
 
-from core.engine import MUTUAL, ONE_SIDED, RANDOM, REPEAT, DateRecord, Engine, RoundRecord
+from core.engine import Engine, RoundRecord
+from core.gui_worker import DisplayState, ParticipantDate, SimulationWorker
 
 WIDTH, HEIGHT = 1360, 880
-HEADER_H = 76
-JUMP_BAR_H = 50
-FOOTER_H = 46
-BANNER_H = 42
-PAD = 18
-PANEL_W = 540
-
-BACKDROP = (40, 30, 52)
-BACKDROP_DARK = (28, 20, 38)
-PANEL = (52, 40, 68)
-PANEL_EDGE = (128, 104, 156)
-INK = (244, 238, 248)
-INK_DIM = (184, 170, 200)
-GOLD = (236, 196, 84)
-ALERT = (198, 48, 48)
-ALERT_TEXT = (255, 226, 226)
-GOOD = (140, 220, 150)
-WARN = (224, 158, 46)
-HEART = (240, 110, 160)
-SELECT = (255, 255, 255)
-
-STAGE_COLORS = {
-	REPEAT: (96, 200, 230),
-	MUTUAL: (120, 214, 130),
-	ONE_SIDED: (232, 164, 70),
-	RANDOM: (150, 140, 160),
-}
-
-GROUP_COLORS = (
-	(94, 156, 236),
-	(232, 112, 104),
-	(126, 206, 140),
-	(204, 140, 228),
-	(240, 186, 90),
-	(96, 210, 206),
-	(236, 134, 190),
-	(170, 176, 96),
-	(150, 130, 236),
-	(220, 150, 120),
-)
-
+PAD, HEADER_H, FOOTER_H = 18, 76, 46
+BACKDROP = (248, 244, 235)
+BACKDROP_DARK = (238, 226, 207)
+PANEL = (255, 253, 248)
+PANEL_EDGE = (222, 204, 176)
+INK, INK_DIM = (43, 34, 26), (83, 66, 49)
+GOLD, GOOD, WARN = (133, 66, 18), (20, 112, 62), (151, 78, 0)
+ALERT, ALERT_TEXT = (198, 48, 48), (255, 226, 226)
 SPEEDS = (1, 2, 4, 8, 16, 32)
-DEFAULT_SPEED_INDEX = 1
-FAULT_LOG_LIMIT = 4
-FAULT_FLASH_ROUNDS = 3
+FAULT_LOG_LIMIT, FAULT_FLASH_ROUNDS = 4, 3
+PROFILE_ROWS, HISTORY_ROWS = 8, 12
+HISTORY_ROW_H = 32
+STRIPE = (249, 243, 232)
 
 
-def ring_positions(count: int, center: tuple[float, float], radius: float) -> list[tuple[int, int]]:
-	"""Evenly spaced points on a circle, person 0 at twelve o'clock."""
-	cx, cy = center
-	points = []
-	for i in range(count):
-		angle = -math.pi / 2 + 2 * math.pi * i / count
-		points.append((int(cx + radius * math.cos(angle)), int(cy + radius * math.sin(angle))))
-	return points
+def trait_penalty(actual, desired, monotonic):
+	gap = max(0, desired - actual) if monotonic else desired - actual
+	return gap * gap
 
 
-def _flags(record: DateRecord, person: int) -> str:
-	decision = record.decisions.get(person)
-	if decision is None:
-		return '-'
-	parts = []
-	if decision.again:
-		parts.append('again')
-	if decision.propose:
-		parts.append('propose')
+def penalty_color(penalty):
+	if penalty == 0:
+		return GOOD
+	# All reds remain dark enough to read on the cream background.
+	strength = min(100, penalty) / 100
+	return (int(165 - 55 * strength), int(65 - 45 * strength), int(55 - 35 * strength))
+
+
+def short_choice(decision):
 	if decision.incompatible:
-		parts.append('never')
-	return '+'.join(parts) or 'pass'
+		return 'Never again'
+	if decision.propose:
+		return 'Propose + another date' if decision.again else 'Propose'
+	return 'Another date' if decision.again else 'No action'
+
+
+def decision_text(decision):
+	if decision.incompatible:
+		return 'Marked the other person incompatible.'
+	if decision.propose and decision.again:
+		return 'Proposed marriage and asked to meet again.'
+	if decision.propose:
+		return 'Proposed marriage.'
+	if decision.again:
+		return 'Asked to meet again.'
+	return 'Took no action.'
+
+
+def pairing_text(how):
+	return {
+		'repeat': 'Both asked to meet again after their previous date.',
+		'mutual': 'Both listed each other before this round.',
+		'one-sided': 'Only one listed the other before this round.',
+		'random': 'Neither listed the other; the engine paired those left.',
+	}[how]
+
+
+def result_text(entry, ended=False):
+	if entry.married:
+		return 'Both proposed. They married and left the dating pool.'
+	if entry.decision.incompatible or entry.partner_decision.incompatible:
+		return 'They are incompatible and will never be paired again.'
+	if ended:
+		return 'The simulation ended before another date could happen.'
+	if entry.again:
+		return 'Both asked to meet again. A repeat date was scheduled.'
+	if entry.decision.again or entry.partner_decision.again:
+		return 'Only one asked again. There is no guaranteed repeat.'
+	if entry.decision.propose or entry.partner_decision.propose:
+		return 'Only one proposed. No marriage or guaranteed repeat.'
+	return 'Neither asked again. Both stay in the dating pool.'
 
 
 class Visualizer:
-	"""Simulation state plus drawing. Kept separate from the event loop so a
-	test can advance and render a full run headlessly."""
-
 	def __init__(
 		self,
-		engine: Engine,
+		engine: Engine | DisplayState,
 		on_round: Callable[[RoundRecord], None] | None = None,
-	) -> None:
-		self.engine = engine
-		self.on_round = on_round
-		self.record: RoundRecord | None = None
-		self.playing = False
-		self.speed_index = DEFAULT_SPEED_INDEX
-		self.finished = engine.finished
-		self.selected: int | None = None
-		self.fault_log: list[tuple[int, str]] = []
-		self.last_fault_round = -FAULT_FLASH_ROUNDS - 1
-		self.fonts: dict[str, pygame.font.Font] = {}
-		# Always-visible skip box. Digits land here; Enter jumps forward.
-		# Cannot rewind: the engine has already consumed the RNG.
-		self.goto_buffer = ''
-		self.goto_error: str | None = None
+		worker: SimulationWorker | None = None,
+	):
+		self.engine, self.on_round, self.worker = engine, on_round, worker
+		self.record = None
+		self.playing, self.finished = False, engine.finished
+		self.speed_index, self.selected = 1, 0
+		self.input_focus = 'participant'
+		self.person_buffer = self.goto_buffer = ''
+		self.person_error = self.goto_error = self.jump_target = None
+		self.profile_offset = self.history_offset = self.history_selected = 0
+		self.fault_log, self.last_fault_round, self.fonts = [], -10, {}
+		self.person_box = pygame.Rect(152, 86, 100, 30)
+		self.show_button = pygame.Rect(264, 86, 65, 30)
+		self.round_box = pygame.Rect(720, 86, 100, 30)
+		self.participant_panel = pygame.Rect(18, 148, 1324, 668)
+		self.history_area = pygame.Rect(380, 350, 946, HISTORY_ROWS * HISTORY_ROW_H)
+		self.histories = [[] for _ in range(engine.people)] if isinstance(engine, Engine) else None
+		if self.histories is not None:
+			for record in engine.records:
+				self.remember(record)
 
-		self.groups: dict[str, tuple[int, int, int]] = {}
-		for name in engine.player_names:
-			if name not in self.groups:
-				self.groups[name] = GROUP_COLORS[len(self.groups) % len(GROUP_COLORS)]
+	def remember(self, record):
+		if self.histories is not None:
+			for date in record.dates:
+				for person in (date.a, date.b):
+					self.histories[person].append(ParticipantDate.from_record(record, date, person))
 
-		arena_w = WIDTH - PANEL_W - 3 * PAD
-		top = HEADER_H + JUMP_BAR_H + PAD
-		arena_h = HEIGHT - top - FOOTER_H - PAD
-		self.arena = pygame.Rect(PAD, top, arena_w, arena_h)
-		self.panel = pygame.Rect(self.arena.right + PAD, top, PANEL_W, arena_h)
-		ring = min(arena_w, arena_h - 60) / 2 - 36
-		center = (self.arena.centerx, self.arena.y + (arena_h - 60) / 2 + 6)
-		self.positions = ring_positions(engine.people, center, ring)
-		spacing = 2 * math.pi * ring / engine.people
-		self.node_r = int(max(5, min(22, spacing * 0.38)))
+	def history(self):
+		if self.histories is not None:
+			return self.histories[self.selected]
+		return self.engine.history if self.engine.participant == self.selected else []
 
-	# ------------------------------------------------------------------ state
+	def select_person(self, person):
+		if not 0 <= person < self.engine.people:
+			self.person_error = f'Use ID 0 to {self.engine.people - 1}'
+			return
+		changed = person != self.selected
+		self.selected = person
+		self.person_error = None
+		self.person_buffer = ''
+		self.profile_offset = self.history_offset = self.history_selected = 0
+		if changed and self.worker is not None:
+			self.worker.inspect(person)
+
+	def type_key(self, key, unicode):
+		if key == pygame.K_TAB:
+			self.input_focus = 'round' if self.input_focus == 'participant' else 'participant'
+			return
+		if key in (pygame.K_p, pygame.K_g):
+			self.input_focus = 'participant' if key == pygame.K_p else 'round'
+			return
+		name = 'person_buffer' if self.input_focus == 'participant' else 'goto_buffer'
+		value = getattr(self, name)
+		if len(unicode) == 1 and unicode in '0123456789' and len(value) < 9:
+			setattr(self, name, value + unicode)
+		elif key == pygame.K_BACKSPACE:
+			setattr(self, name, value[:-1])
+		elif key in (pygame.K_RETURN, pygame.K_KP_ENTER) and value:
+			if self.input_focus == 'participant':
+				self.select_person(int(value))
+			else:
+				self.jump_to(int(value))
+			setattr(self, name, '')
+		elif key in (pygame.K_PAGEUP, pygame.K_PAGEDOWN):
+			direction = -1 if key == pygame.K_PAGEUP else 1
+			self.profile_offset = max(
+				0,
+				min(
+					self.profile_offset + direction * PROFILE_ROWS,
+					max(0, self.engine.dims - PROFILE_ROWS),
+				),
+			)
+
+	def select_at(self, pos):
+		if self.person_box.collidepoint(pos):
+			self.input_focus = 'participant'
+		elif self.round_box.collidepoint(pos):
+			self.input_focus = 'round'
+		elif self.show_button.collidepoint(pos) and self.person_buffer:
+			self.select_person(int(self.person_buffer))
+		elif self.history_area.collidepoint(pos):
+			index = self.history_offset + (pos[1] - self.history_area.y) // HISTORY_ROW_H
+			if index < len(self.history()):
+				self.history_selected = index
+
+	def scroll_history(self, direction):
+		self.history_offset = max(
+			0, min(self.history_offset + direction, max(0, len(self.history()) - HISTORY_ROWS))
+		)
+
+	def render_key(self):
+		return (
+			self.engine.round,
+			self.selected,
+			self.playing,
+			self.speed_index,
+			self.finished,
+			self.jump_target,
+			self.goto_buffer,
+			self.goto_error,
+			self.person_buffer,
+			self.person_error,
+			self.input_focus,
+			self.profile_offset,
+			self.history_offset,
+			self.history_selected,
+			getattr(self.engine, 'participant', self.selected),
+			len(self.history()),
+		)
+
+	def text(self, surface, value, pos, name='small', color=None, anchor='topleft', width=None):
+		color = INK if color is None else color
+		value = str(value)
+		font = self.font(name)
+		if width is not None and font.size(value)[0] > width:
+			while value and font.size(value + '...')[0] > width:
+				value = value[:-1]
+			value += '...'
+		image = font.render(value, True, color)
+		rect = image.get_rect()
+		setattr(rect, anchor, pos)
+		surface.blit(image, rect)
+		return rect
+
+	def draw_controls(self, surface):
+		self.text(surface, 'Participant ID', (18, 94), color=INK_DIM)
+		self.text(surface, 'Skip to round', (584, 94), color=INK_DIM)
+		for kind, rect, value in [
+			('participant', self.person_box, self.person_buffer or str(self.selected)),
+			('round', self.round_box, self.goto_buffer or '#'),
+		]:
+			pygame.draw.rect(surface, PANEL, rect, border_radius=5)
+			pygame.draw.rect(
+				surface,
+				GOLD if self.input_focus == kind else PANEL_EDGE,
+				rect,
+				2,
+				border_radius=5,
+			)
+			self.text(surface, value, (rect.x + 8, rect.y + 7), width=rect.w - 16)
+		pygame.draw.rect(surface, PANEL_EDGE, self.show_button, border_radius=5)
+		self.text(surface, 'Show', self.show_button.center, 'tiny', anchor='center')
+		hint = (
+			f'Skipping to {self.jump_target} - SPACE cancels'
+			if self.jump_target is not None
+			else 'Enter to jump'
+		)
+		self.text(
+			surface,
+			self.goto_error or hint,
+			(834, 94),
+			'tiny',
+			WARN if self.goto_error else INK_DIM,
+			width=508,
+		)
+		if self.person_error:
+			self.text(surface, self.person_error, (18, 123), 'tiny', WARN)
+
+	def draw(self, surface):
+		surface.fill(BACKDROP)
+		self.draw_header(surface)
+		self.draw_controls(surface)
+		pygame.draw.rect(surface, PANEL, self.participant_panel, border_radius=10)
+		pygame.draw.rect(surface, PANEL_EDGE, self.participant_panel, 2, border_radius=10)
+		self.draw_participant(surface)
+		pygame.draw.rect(surface, BACKDROP_DARK, (0, HEIGHT - FOOTER_H, WIDTH, FOOTER_H))
+		self.text(
+			surface,
+			'SPACE play/pause   RIGHT/S step   UP/DOWN speed   P select ID   G skip   Q quit',
+			(18, HEIGHT - 32),
+			'tiny',
+			INK_DIM,
+		)
+		state = 'finished' if self.finished else ('playing' if self.playing else 'paused')
+		self.text(
+			surface,
+			f'{state} | {self.speed} rounds/s',
+			(WIDTH - PAD, HEIGHT - 32),
+			'tiny',
+			INK_DIM,
+			anchor='topright',
+		)
+		if self.fault_log and self.engine.round - self.last_fault_round < FAULT_FLASH_ROUNDS:
+			pygame.draw.rect(surface, ALERT, (0, 144, WIDTH, 18))
+			self.text(
+				surface,
+				self.fault_log[-1][1],
+				(18, 146),
+				'tiny',
+				ALERT_TEXT,
+				width=WIDTH - 36,
+			)
+
+	def draw_participant(self, surface):
+		e, i = self.engine, self.selected
+		x = 34
+		self.text(surface, f'Participant {i} | {e.player_names[i]}', (x, 170), 'mid')
+		partner = e.spouse[i]
+		status = (
+			f'Married to {partner} in round {e.married_on[i]}' if partner is not None else 'Single'
+		)
+		self.text(
+			surface,
+			f'Status: {status}',
+			(x, 212),
+			color=GOLD if partner is not None else INK,
+		)
+		score = e.happiness(i)
+		self.text(surface, 'Happiness', (1030, 212), color=INK_DIM)
+		self.text(
+			surface,
+			f'{score:,.2f}',
+			(1160, 207),
+			'mid',
+			GOOD if score > 0 else (ALERT if score < 0 else INK),
+		)
+		self.text(
+			surface,
+			f'Dates: {e.dates_had[i]}    Proposals made: {e.proposals_made[i]}    Received: {e.proposals_received[i]}',
+			(x, 248),
+			'small',
+			INK_DIM,
+		)
+		ad = e.ads[i]
+		self.text(
+			surface,
+			f'Advertisement: own trait {ad.own_dim} = {ad.own_value}; wants trait {ad.seek_dim} = {ad.seek_value}',
+			(600, 248),
+			'small',
+			INK_DIM,
+			width=720,
+		)
+		# Keep the static profile compact; most of the panel belongs to dates.
+		pygame.draw.line(surface, PANEL_EDGE, (354, 286), (354, 795), 2)
+		self.text(surface, 'Profile', (x, 290), 'mid')
+		history = list(reversed(self.history()))
+		entry = history[min(self.history_selected, len(history) - 1)] if history else None
+		married = partner is not None
+		context = (
+			f'Married partner {partner}'
+			if married
+			else f'Round {entry.round} · Partner {entry.partner}'
+			if entry
+			else 'No date yet'
+		)
+		self.text(surface, context, (x, 320), 'small', INK_DIM)
+		# Each pair of adjacent columns compares the value with its target.
+		labels = [
+			('Trait', ''),
+			('Actual', ''),
+			('Partner', 'wants') if married else ('Shown', 'by you'),
+			('Desired', ''),
+			('Partner', 'true') if married else ('Partner', 'seen'),
+		]
+		cols = [x, 88, 150, 218, 284]
+		for (top, bottom), col in zip(labels, cols, strict=True):
+			self.text(surface, top, (col, 352), 'tiny', INK_DIM)
+			self.text(surface, bottom, (col, 372), 'tiny', INK_DIM)
+		for row, dim in enumerate(
+			range(self.profile_offset, min(e.dims, self.profile_offset + PROFILE_ROWS))
+		):
+			y = 405 + row * 32
+			actual, desired = e.profiles[i][dim], e.ideals[i][dim]
+			other_wants = (
+				e.ideals[partner][dim]
+				if married
+				else (entry.partner_stated[dim] if entry else None)
+			)
+			shown = e.ideals[partner][dim] if married else (entry.shown[dim] if entry else None)
+			seen = e.profiles[partner][dim] if married else (entry.observed[dim] if entry else None)
+			own_color = (
+				penalty_color(
+					trait_penalty(actual if married else shown, other_wants, dim < e.monotonic)
+				)
+				if other_wants is not None
+				else INK
+			)
+			partner_color = (
+				penalty_color(trait_penalty(seen, desired, dim < e.monotonic))
+				if seen is not None
+				else INK
+			)
+			values = [
+				f'{dim}+' if dim < e.monotonic else str(dim),
+				actual,
+				shown if shown is not None else '—',
+				desired,
+				seen if seen is not None else '—',
+			]
+			colors = [INK, own_color if married else INK, own_color, partner_color, partner_color]
+			for value, col, color in zip(values, cols, colors, strict=True):
+				self.text(surface, value, (col, y), 'small', color)
+		self.text(surface, 'Green: zero penalty', (x, 685), 'small', GOOD)
+		self.text(surface, 'Darker red: larger penalty', (x, 712), 'small', penalty_color(60))
+		self.text(surface, '+ higher is better; others: closer', (x, 740), 'tiny', INK_DIM)
+		if e.dims > PROFILE_ROWS:
+			self.text(surface, 'Page Up / Down: more traits', (x, 770), 'tiny', INK_DIM)
+
+		hx = self.history_area.x
+		self.text(surface, 'Dating history', (hx, 286), 'mid')
+		self.text(
+			surface,
+			'Newest first · Scroll for older dates · Click to explain',
+			(620, 292),
+			'small',
+			INK_DIM,
+		)
+		columns = [(hx, 65), (450, 85), (540, 120), (665, 65), (735, 235), (975, 235), (1215, 105)]
+		for label, (col, width) in zip(
+			['Round', 'Partner', 'Pairing', 'Date #', 'This person', 'Their partner', 'Married'],
+			columns,
+			strict=True,
+		):
+			self.text(surface, label, (col, 326), 'small', INK_DIM, width=width)
+		history = list(reversed(self.history()))
+		for row, entry in enumerate(
+			history[self.history_offset : self.history_offset + HISTORY_ROWS]
+		):
+			line_y = self.history_area.y + row * HISTORY_ROW_H
+			selected = self.history_offset + row == self.history_selected
+			pygame.draw.rect(
+				surface,
+				PANEL_EDGE if selected else (STRIPE if row % 2 == 0 else PANEL),
+				(hx - 3, line_y - 2, self.history_area.w, HISTORY_ROW_H),
+				border_radius=3,
+			)
+			values = [
+				entry.round,
+				entry.partner,
+				entry.how,
+				entry.number,
+				short_choice(entry.decision),
+				short_choice(entry.partner_decision),
+				'Yes' if entry.married else '—',
+			]
+			for value, (col, width) in zip(values, columns, strict=True):
+				self.text(
+					surface,
+					value,
+					(col, line_y + 3),
+					'small',
+					GOOD if entry.married else INK,
+					width=width,
+				)
+		if not history:
+			loading = isinstance(e, DisplayState) and e.participant != i
+			self.text(
+				surface,
+				'Loading history...' if loading else 'No dates recorded.',
+				(hx, 370),
+				'mid',
+				INK_DIM,
+			)
+		else:
+			entry = history[min(self.history_selected, len(history) - 1)]
+			self.text(
+				surface,
+				f'Round {entry.round}, partner {entry.partner}: {pairing_text(entry.how)}',
+				(hx, 752),
+				'small',
+				INK_DIM,
+				width=946,
+			)
+			self.text(
+				surface,
+				result_text(entry, ended=e.finished and entry.round == e.round),
+				(hx, 781),
+				'small',
+				INK_DIM,
+				width=946,
+			)
 
 	@property
 	def speed(self) -> int:
@@ -140,12 +465,20 @@ class Visualizer:
 	def advance(self) -> None:
 		"""Play one round. The engine owns every rule; this only records what
 		came back so the next frame can draw it."""
+		if self.worker is not None:
+			if not self.finished:
+				self.worker.request(self.jump_target)
+			return
 		record = self.engine.step()
+		self.accept_round(record)
+
+	def accept_round(self, record: RoundRecord | None) -> None:
 		if record is None:
 			self.finished = True
 			self.playing = False
 			return
 		self.record = record
+		self.remember(record)
 		for fault in record.faults:
 			self.fault_log.append((record.round, fault))
 			self.last_fault_round = record.round
@@ -157,6 +490,12 @@ class Visualizer:
 			self.playing = False
 
 	def toggle(self) -> None:
+		if self.jump_target is not None:
+			if self.worker is not None:
+				self.worker.cancel_jump.set()
+			self.jump_target = None
+			self.playing = False
+			return
 		if not self.finished:
 			self.playing = not self.playing
 
@@ -168,84 +507,42 @@ class Visualizer:
 
 	def jump_to(self, target: int) -> None:
 		"""Advance until ``target`` rounds have been played, or the run ends."""
+		if self.finished:
+			self.goto_error = f'simulation finished at round {self.engine.round}'
+			return
 		if target <= self.engine.round:
 			self.goto_error = f'already past round {target}'
 			return
 		self.goto_error = None
+		if self.worker is not None:
+			self.playing = False
+			self.jump_target = min(target, self.engine.rounds)
+			self.advance()
+			return
 		while not self.finished and self.engine.round < target:
 			self.advance()
-
-	def type_key(self, key: int, unicode: str) -> None:
-		if unicode in '0123456789' and len(unicode) == 1 and len(self.goto_buffer) < 6:
-			self.goto_buffer += unicode
-		elif key == pygame.K_BACKSPACE:
-			self.goto_buffer = self.goto_buffer[:-1]
-		elif key in (pygame.K_RETURN, pygame.K_KP_ENTER) and self.goto_buffer:
-			self.jump_to(int(self.goto_buffer))
-			self.goto_buffer = ''
-
-	def select_at(self, pos: tuple[int, int]) -> None:
-		"""Select the person under ``pos``, or clear the selection."""
-		reach = max(self.node_r, 8) + 3
-		best = None
-		for i, (x, y) in enumerate(self.positions):
-			dist = math.hypot(pos[0] - x, pos[1] - y)
-			if dist <= reach and (best is None or dist < best[0]):
-				best = (dist, i)
-		self.selected = None if best is None else best[1]
-
-	# ------------------------------------------------------------------ drawing
 
 	def font(self, name: str) -> pygame.font.Font:
 		if not self.fonts:
 			self.fonts = {
-				'big': pygame.font.Font(None, 40),
-				'mid': pygame.font.Font(None, 28),
-				'small': pygame.font.Font(None, 22),
-				'tiny': pygame.font.Font(None, 18),
+				'big': pygame.font.SysFont('arial,helvetica,dejavusans', 30, bold=True),
+				'mid': pygame.font.SysFont('arial,helvetica,dejavusans', 22, bold=True),
+				'small': pygame.font.SysFont('arial,helvetica,dejavusans', 18),
+				'tiny': pygame.font.SysFont('arial,helvetica,dejavusans', 15),
 			}
 		return self.fonts[name]
-
-	def text(
-		self,
-		surface: pygame.Surface,
-		value: str,
-		pos: tuple[int, int],
-		name: str = 'small',
-		color: tuple[int, int, int] = INK,
-		anchor: str = 'topleft',
-	) -> pygame.Rect:
-		image = self.font(name).render(value, True, color)
-		rect = image.get_rect()
-		setattr(rect, anchor, pos)
-		surface.blit(image, rect)
-		return rect
-
-	def draw(self, surface: pygame.Surface) -> None:
-		surface.fill(BACKDROP)
-		self.draw_header(surface)
-		self.draw_jump_bar(surface)
-		self.draw_arena(surface)
-		self.draw_panel(surface)
-		self.draw_footer(surface)
-		if self.engine.round - self.last_fault_round < FAULT_FLASH_ROUNDS and self.fault_log:
-			self.draw_banner(surface)
 
 	def draw_header(self, surface: pygame.Surface) -> None:
 		engine = self.engine
 		pygame.draw.rect(surface, BACKDROP_DARK, pygame.Rect(0, 0, WIDTH, HEADER_H))
 		self.text(surface, 'Marriage Market', (PAD, 14), 'big')
-		params = (
-			f'N={engine.people}  d={engine.dims}  m={engine.monotonic}  t={engine.rounds}  '
-			f'B={engine.bonus:g}  P={engine.distribution_name}  seed={engine.seed}'
+		self.text(
+			surface,
+			f'People: {engine.people}    Singles: {len(engine.singles())}    Married couples: {len(engine.marriages)}',
+			(PAD, 50),
+			'small',
+			INK_DIM,
 		)
-		self.text(surface, params, (PAD, 50), 'small', INK_DIM)
-		if self.finished:
-			state, color = 'finished', GOOD
-		elif self.playing:
-			state, color = f'playing  {self.speed} rounds/s', WARN
-		else:
-			state, color = 'paused', INK_DIM
 		self.text(
 			surface,
 			f'round {engine.round} / {engine.rounds}',
@@ -254,237 +551,100 @@ class Visualizer:
 			INK,
 			'topright',
 		)
-		self.text(surface, state, (WIDTH - PAD, 50), 'small', color, 'topright')
 		frac = engine.round / engine.rounds
 		pygame.draw.rect(surface, PANEL_EDGE, pygame.Rect(0, HEADER_H - 5, WIDTH, 5))
 		pygame.draw.rect(surface, GOLD, pygame.Rect(0, HEADER_H - 5, int(WIDTH * frac), 5))
 
-	def draw_jump_bar(self, surface: pygame.Surface) -> None:
-		y = HEADER_H + 10
-		self.text(surface, 'Skip to round', (PAD, y + 7), 'small', INK_DIM)
-		box = pygame.Rect(PAD + 120, y, 110, 30)
-		pygame.draw.rect(surface, PANEL, box, border_radius=6)
-		pygame.draw.rect(surface, PANEL_EDGE, box, width=2, border_radius=6)
-		self.text(surface, self.goto_buffer or '#', (box.x + 10, box.y + 7), 'small', INK)
-		self.text(surface, 'Enter to jump', (box.right + 12, y + 7), 'small', INK_DIM)
-		if self.goto_error:
-			self.text(surface, self.goto_error, (box.right + 140, y + 7), 'small', WARN)
 
-	def draw_arena(self, surface: pygame.Surface) -> None:
-		engine = self.engine
-		pygame.draw.rect(surface, PANEL, self.arena, border_radius=12)
-		pygame.draw.rect(surface, PANEL_EDGE, self.arena, width=2, border_radius=12)
-		pos = self.positions
-
-		done: set[int] = set()
-		for i, partner in enumerate(engine.spouse):
-			if partner is None or i in done:
-				continue
-			done.update((i, partner))
-			pygame.draw.line(surface, GOLD, pos[i], pos[partner], 3)
-
-		if self.record is not None:
-			for date in self.record.dates:
-				color = GOLD if date.married else STAGE_COLORS[date.how]
-				width = 4 if date.married else 2
-				pygame.draw.line(surface, color, pos[date.a], pos[date.b], width)
-				for proposer, other in ((date.a, date.b), (date.b, date.a)):
-					decision = date.decisions.get(proposer)
-					if decision is not None and decision.propose and not date.married:
-						x = pos[proposer][0] + (pos[other][0] - pos[proposer][0]) * 0.22
-						y = pos[proposer][1] + (pos[other][1] - pos[proposer][1]) * 0.22
-						pygame.draw.circle(surface, HEART, (int(x), int(y)), 5)
-
-		r = self.node_r
-		for i, (x, y) in enumerate(pos):
-			color = self.groups[engine.player_names[i]]
-			if engine.spouse[i] is not None:
-				color = tuple(int(c * 0.6) for c in color)
-			pygame.draw.circle(surface, color, (x, y), r)
-			ring = GOLD if engine.spouse[i] is not None else INK_DIM
-			pygame.draw.circle(surface, ring, (x, y), r, 2)
-			if self.selected == i:
-				pygame.draw.circle(surface, SELECT, (x, y), r + 5, 3)
-			if r >= 11:
-				self.text(surface, str(i), (x, y), 'tiny', BACKDROP_DARK, 'center')
-
-		legend_y = self.arena.bottom - 46
-		x = self.arena.x + 16
-		for name, color in self.groups.items():
-			count = engine.player_names.count(name)
-			pygame.draw.circle(surface, color, (x + 7, legend_y + 9), 7)
-			x = self.text(surface, f'{name} x{count}', (x + 20, legend_y + 1), 'small').right + 22
-		x = self.arena.x + 16
-		for stage, color in STAGE_COLORS.items():
-			pygame.draw.line(surface, color, (x, legend_y + 32), (x + 22, legend_y + 32), 3)
-			x = self.text(surface, stage, (x + 28, legend_y + 25), 'small', INK_DIM).right + 18
-		pygame.draw.line(surface, GOLD, (x, legend_y + 32), (x + 22, legend_y + 32), 3)
-		x = self.text(surface, 'married', (x + 28, legend_y + 25), 'small', INK_DIM).right + 18
-		pygame.draw.circle(surface, HEART, (x + 6, legend_y + 32), 5)
-		self.text(surface, 'proposed', (x + 16, legend_y + 25), 'small', INK_DIM)
-
-	def draw_panel(self, surface: pygame.Surface) -> None:
-		engine = self.engine
-		panel = self.panel
-		pygame.draw.rect(surface, PANEL, panel, border_radius=12)
-		pygame.draw.rect(surface, PANEL_EDGE, panel, width=2, border_radius=12)
-		x = panel.x + 16
-		y = panel.y + 14
-
-		married = [i for i in range(engine.people) if engine.spouse[i] is not None]
-		scores = [engine.happiness(i) for i in married]
-		positive = sum(1 for s in scores if s > 0)
-		self.text(surface, 'Market', (x, y), 'mid')
-		y += 30
-		stats = [
-			('single', str(len(engine.singles()))),
-			('married', f'{len(married)}  ({len(engine.marriages)} couples)'),
-			(
-				'married happiness',
-				f'{sum(scores) / len(scores):,.1f} avg' if scores else '-',
-			),
-			('positive so far', f'{positive} / {engine.people}'),
-		]
-		for label, value in stats:
-			self.text(surface, label, (x, y), 'small', INK_DIM)
-			self.text(surface, value, (x + 170, y), 'small')
-			y += 22
-
-		y += 10
-		self.text(surface, 'This round', (x, y), 'mid')
-		y += 30
-		detail_h = 200 if self.selected is not None else 0
-		bottom = panel.bottom - detail_h - 12
-		if self.record is None:
-			self.text(surface, 'press SPACE or RIGHT to start', (x, y), 'small', INK_DIM)
-		else:
-			lines = list(self.record.dates)
-			room = max(0, (bottom - y) // 21)
-			shown = lines if len(lines) <= room else lines[: max(0, room - 1)]
-			for date in shown:
-				color = GOLD if date.married else STAGE_COLORS[date.how]
-				label = f'{date.a:>2} & {date.b:<2}  {date.how} #{date.number}'
-				self.text(surface, label, (x, y), 'small', color)
-				outcome = (
-					'MARRIED'
-					if date.married
-					else (f'{_flags(date, date.a)} / {_flags(date, date.b)}')
-				)
-				self.text(surface, outcome, (x + 220, y), 'small', INK)
-				y += 21
-			if len(shown) < len(lines):
-				self.text(surface, f'+{len(lines) - len(shown)} more', (x, y), 'small', INK_DIM)
-				y += 21
-			if self.record.unmatched:
-				no_date = ', '.join(str(i) for i in self.record.unmatched)
-				self.text(surface, f'no date: {no_date}', (x, y), 'small', WARN)
-
-		if self.selected is not None:
-			self.draw_person(surface, pygame.Rect(panel.x, bottom, panel.w, detail_h))
-
-	def draw_person(self, surface: pygame.Surface, area: pygame.Rect) -> None:
-		engine = self.engine
-		i = self.selected
-		pygame.draw.line(surface, PANEL_EDGE, (area.x + 12, area.y), (area.right - 12, area.y), 1)
-		x = area.x + 16
-		y = area.y + 10
-		color = self.groups[engine.player_names[i]]
-		self.text(surface, f'person {i}  -  {engine.player_names[i]}', (x, y), 'mid', color)
-		y += 30
-		ad = engine.ads[i]
-		partner = engine.spouse[i]
-		status = (
-			f'married to {partner} in round {engine.married_on[i]}  -  happiness '
-			f'{engine.happiness(i):,.1f}'
-			if partner is not None
-			else 'single'
-		)
-		rows = [
-			('true', ' '.join(f'{v:>2}' for v in engine.profiles[i])),
-			('ideal', ' '.join(f'{v:>2}' for v in engine.ideals[i])),
-			('ad', f'own d{ad.own_dim}={ad.own_value}   seeks d{ad.seek_dim}={ad.seek_value}'),
-			('status', status),
-			(
-				'history',
-				f'{engine.dates_had[i]} dates, proposed {engine.proposals_made[i]}, '
-				f'proposed to {engine.proposals_received[i]}',
-			),
-		]
-		for label, value in rows:
-			self.text(surface, label, (x, y), 'small', INK_DIM)
-			self.text(surface, value, (x + 80, y), 'small')
-			y += 24
-		self.text(
-			surface,
-			f'first {engine.monotonic} dimension(s) monotonic',
-			(x, y + 4),
-			'tiny',
-			INK_DIM,
-		)
-
-	def draw_footer(self, surface: pygame.Surface) -> None:
-		pygame.draw.rect(surface, BACKDROP_DARK, pygame.Rect(0, HEIGHT - FOOTER_H, WIDTH, FOOTER_H))
-		self.text(
-			surface,
-			'SPACE play/pause    RIGHT/S next round    UP/DOWN speed    click a person    Q quit',
-			(PAD, HEIGHT - FOOTER_H + 14),
-			'small',
-			INK_DIM,
-		)
-
-	def draw_banner(self, surface: pygame.Surface) -> None:
-		rect = pygame.Rect(0, HEADER_H, WIDTH, BANNER_H)
-		pygame.draw.rect(surface, ALERT, rect)
-		round_no, fault = self.fault_log[-1]
-		extra = f'  (+{len(self.fault_log) - 1} more)' if len(self.fault_log) > 1 else ''
-		self.text(
-			surface,
-			f'FAULT round {round_no}: {fault}{extra}'[:150],
-			(PAD, HEADER_H + 12),
-			'small',
-			ALERT_TEXT,
-		)
-
-
-def run_gui(engine: Engine, on_round: Callable[[RoundRecord], None] | None = None) -> None:
+def run_gui(
+	engine: Engine | None = None,
+	on_round: Callable[[RoundRecord], None] | None = None,
+	*,
+	worker: SimulationWorker | None = None,
+) -> None:
 	pygame.init()
 	pygame.display.set_caption('COMS W4444 - Marriage Market')
 	screen = pygame.display.set_mode((WIDTH, HEIGHT))
 	clock = pygame.time.Clock()
-	view = Visualizer(engine, on_round=on_round)
+	view = Visualizer(engine, on_round=on_round) if engine is not None else None
 	carry = 0.0
+	frame_key = None
 
 	running = True
-	while running:
-		dt = clock.tick(60) / 1000.0
-		for event in pygame.event.get():
-			if event.type == pygame.QUIT:
-				running = False
-			elif event.type == pygame.KEYDOWN:
-				if event.key in (pygame.K_q, pygame.K_ESCAPE):
+	try:
+		while running:
+			if worker is not None:
+				message = worker.poll()
+				if message is not None:
+					kind, state, record = message
+					if view is None:
+						view = Visualizer(state, worker=worker)
+					else:
+						view.engine = state
+						view.finished = state.finished
+						if kind == 'round':
+							view.accept_round(record)
+						if state.participant != view.selected:
+							worker.inspect(view.selected)
+					if view.finished or (
+						view.jump_target is not None and state.round >= view.jump_target
+					):
+						view.jump_target = None
+			# The event loop below is intentionally limited to one worker request.
+			dt = clock.tick(60) / 1000.0
+			for event in pygame.event.get():
+				if event.type == pygame.WINDOWEXPOSED:
+					frame_key = None
+				if event.type == pygame.QUIT or (
+					event.type == pygame.KEYDOWN and event.key in (pygame.K_q, pygame.K_ESCAPE)
+				):
 					running = False
-				elif event.key == pygame.K_SPACE:
-					view.toggle()
-				elif event.key in (pygame.K_RIGHT, pygame.K_s):
+					break
+				if view is None:
+					continue
+				if event.type == pygame.KEYDOWN:
+					if event.key == pygame.K_SPACE:
+						view.toggle()
+					elif event.key in (pygame.K_RIGHT, pygame.K_s):
+						view.advance()
+					elif event.key == pygame.K_UP:
+						view.faster()
+					elif event.key == pygame.K_DOWN:
+						view.slower()
+					else:
+						view.type_key(event.key, event.unicode)
+				elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+					view.select_at(event.pos)
+				elif event.type == pygame.MOUSEWHEEL:
+					view.scroll_history(-event.y)
+			if not running:
+				break
+			if view is None:
+				if frame_key != 'loading':
+					screen.fill(BACKDROP)
+					font = pygame.font.Font(None, 32)
+					screen.blit(
+						font.render('Preparing simulation... Q to quit', True, INK), (PAD, PAD)
+					)
+					pygame.display.flip()
+					frame_key = 'loading'
+			else:
+				if view.jump_target is not None:
 					view.advance()
-				elif event.key == pygame.K_UP:
-					view.faster()
-				elif event.key == pygame.K_DOWN:
-					view.slower()
+				elif view.playing:
+					carry = min(1.0, carry + dt * view.speed)
+					if carry >= 1.0 and (worker is None or not worker.pending):
+						carry = 0.0
+						view.advance()
 				else:
-					view.type_key(event.key, event.unicode)
-			elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
-				view.select_at(event.pos)
-
-		if view.playing:
-			carry += dt * view.speed
-			while carry >= 1.0 and view.playing:
-				carry -= 1.0
-				view.advance()
-		else:
-			carry = 0.0
-
-		view.draw(screen)
-		pygame.display.flip()
-
-	pygame.quit()
+					carry = 0.0
+				key = view.render_key()
+				if key != frame_key:
+					view.draw(screen)
+					pygame.display.flip()
+					frame_key = key
+	finally:
+		# Close the window before waiting for any in-flight round to finish.
+		pygame.quit()
+		if worker is not None:
+			worker.close()

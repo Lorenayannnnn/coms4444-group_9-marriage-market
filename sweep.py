@@ -48,6 +48,7 @@ DEFAULTS = {
 	'monotonic': 2,
 	'distribution': 'mixed',
 	'timeout': 1.0,
+	'list_multiple': 4.0,
 }
 
 
@@ -63,6 +64,7 @@ class Cell:
 	monotonic: int
 	distribution: Any
 	timeout: float
+	list_multiple: float = 4.0
 
 	@property
 	def people(self) -> int:
@@ -131,6 +133,7 @@ def _cell_from(raw: dict, defaults: dict, index: int) -> Cell:
 		monotonic=int(merged['monotonic']),
 		distribution=_distribution_of(merged['distribution']),
 		timeout=float(merged['timeout']),
+		list_multiple=float(merged['list_multiple']),
 	)
 
 
@@ -212,6 +215,7 @@ def _run_one(job: dict) -> dict:
 		distribution=job['distribution'],
 		timeout=job['timeout'],
 		keep_records=False,
+		list_multiple=job.get('list_multiple', 4.0),
 	).run()
 
 	married_rounds = [m['round'] for m in results['marriages']]
@@ -243,6 +247,7 @@ def build_jobs(config: SweepConfig) -> list[dict]:
 					'monotonic': cell.monotonic,
 					'distribution': cell.distribution,
 					'timeout': cell.timeout,
+					'list_multiple': cell.list_multiple,
 				}
 			)
 	return jobs
@@ -272,6 +277,7 @@ def validate(config: SweepConfig) -> None:
 				distribution=cell.distribution,
 				seed=0,
 				timeout=0,
+				list_multiple=cell.list_multiple,
 			)
 		except ValueError as exc:
 			raise SystemExit(f"cell '{cell.label}' is not a legal configuration: {exc}") from exc
@@ -524,6 +530,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 	parser.add_argument('--bonus', type=float, help='Override B for every cell.')
 	parser.add_argument('--timeout', type=float, help='Override the player time budget.')
 	parser.add_argument(
+		'--list-multiple',
+		type=float,
+		help='Override the returned interest-list limit; 0 disables.',
+	)
+	parser.add_argument(
 		'--workers',
 		type=int,
 		default=0,
@@ -538,7 +549,7 @@ def apply_overrides(config: SweepConfig, args: argparse.Namespace) -> SweepConfi
 
 	changes = {
 		key: getattr(args, key)
-		for key in ('rounds', 'bonus', 'timeout')
+		for key in ('rounds', 'bonus', 'timeout', 'list_multiple')
 		if getattr(args, key) is not None
 	}
 	if changes:

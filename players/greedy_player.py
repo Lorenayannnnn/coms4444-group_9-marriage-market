@@ -61,7 +61,7 @@ class GreedyPlayer(BasePlayer):
 			key=lambda c: (self._ad_cost(c.ad), c.index),
 		)
 		chosen += [c.index for c in fresh[: max(1, len(fresh) // 2)]]
-		return chosen
+		return chosen[: self.list_limit]
 
 	def decide(self, date: DateContext, observed: Profile, stated_ideal: Profile) -> Decision:
 		mine = decrement(self.ideal, observed, self.monotonic)

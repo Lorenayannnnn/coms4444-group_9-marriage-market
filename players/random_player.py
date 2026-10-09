@@ -29,7 +29,10 @@ class RandomPlayer(BasePlayer):
 		)
 
 	def choose_dates(self, candidates: tuple[Candidate, ...], turn: RoundContext) -> list[int]:
-		return [c.index for c in candidates if self.rng.random() < 0.5]
+		chosen = [c.index for c in candidates if self.rng.random() < 0.5]
+		if self.list_limit is not None and len(chosen) > self.list_limit:
+			return self.rng.sample(chosen, self.list_limit)
+		return chosen
 
 	def decide(self, date: DateContext, observed: Profile, stated_ideal: Profile) -> Decision:
 		propose = date.date_number >= 2 and self.rng.random() < 0.25

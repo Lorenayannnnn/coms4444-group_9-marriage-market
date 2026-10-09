@@ -92,3 +92,19 @@ def test_main_writes_outputs(tmp_path, capsys):
 	assert (tmp_path / 'out' / 'mini.csv').exists()
 	assert (tmp_path / 'out' / 'mini_runs.csv').exists()
 	assert 'only' in capsys.readouterr().out
+
+
+def test_list_limit_configuration_reaches_sweep_jobs(tmp_path):
+	path = tmp_path / 'limits.json'
+	path.write_text(
+		json.dumps(
+			{
+				'defaults': {'players': [['g', 100]], 'rounds': 1},
+				'grid': {'list_multiple': [0, 2, 4]},
+			}
+		)
+	)
+	config = load_config(path)
+	assert [cell.list_multiple for cell in config.cells] == [0, 2, 4]
+	assert [job['list_multiple'] for job in build_jobs(config)] == [0, 2, 4]
+	sweep.validate(config)

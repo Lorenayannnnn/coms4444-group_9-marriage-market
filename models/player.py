@@ -34,6 +34,7 @@ class GameContext:
 	monotonic: int
 	rounds: int
 	bonus: float
+	list_limit: int | None = None
 
 
 @dataclass(frozen=True)
@@ -138,6 +139,7 @@ class Player(ABC):
 		self.monotonic = ctx.monotonic
 		self.rounds = ctx.rounds
 		self.bonus = ctx.bonus
+		self.list_limit = ctx.list_limit
 
 	def __repr__(self) -> str:
 		return f'{self.name}(index={self.index})'

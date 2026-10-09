@@ -79,3 +79,22 @@ def test_csv_preserves_partial_run_without_records(tmp_path):
 	assert len([r for r in rows if r['event'] == 'date']) == 2
 	assert len([r for r in rows if r['event'] == 'result']) == 2
 	assert engine.records == []
+
+
+def test_logs_flush_once_per_completed_round(tmp_path, monkeypatch):
+	engine = Engine([GreedyPlayer] * 20, rounds=1, timeout=0)
+	log = RunLog.create(str(tmp_path / 'buffered.log'), engine)
+	flushes = []
+	original = log.flush
+
+	def flush():
+		flushes.append(True)
+		original()
+
+	monkeypatch.setattr(log, 'flush', flush)
+	log.record_round(engine.step(), engine)
+	assert len(flushes) == 1
+	# Other readers can see the complete round before finalization.
+	assert 'round 1' in log.path.read_text()
+	assert 'date' in log.csv_path.read_text(encoding='utf-8-sig')
+	log.finish(engine)

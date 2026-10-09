@@ -18,10 +18,10 @@ from core.engine import Engine  # noqa: E402
 from players.greedy_player import GreedyPlayer  # noqa: E402
 from players.random_player import RandomPlayer  # noqa: E402
 from tests.fixtures.scripted import scripted  # noqa: E402
-from ui.gui import HEIGHT, WIDTH, Visualizer, ring_positions  # noqa: E402
+from ui.gui import HEIGHT, WIDTH, Visualizer  # noqa: E402
 
 
-@pytest.fixture(scope='module')
+@pytest.fixture
 def screen():
 	pygame.init()
 	surface = pygame.display.set_mode((WIDTH, HEIGHT))
@@ -65,23 +65,25 @@ def test_fault_banner_renders(screen):
 	view.draw(screen)
 
 
-def test_ring_positions_start_at_the_top():
-	points = ring_positions(4, (100, 100), 50)
-	assert points[0] == (100, 50)
-	assert points[2] == (100, 150)
-
-
-def test_click_selects_the_nearest_person(screen):
+def test_participant_id_selects_person(screen):
 	view = Visualizer(build())
-	view.select_at(view.positions[7])
+	view.type_key(pygame.K_p, 'p')
+	view.type_key(0, '7')
+	view.type_key(pygame.K_RETURN, '\r')
 	assert view.selected == 7
 	view.draw(screen)
-	view.select_at((1, 1))
-	assert view.selected is None
+	view.type_key(0, '8')
+	view.select_at(view.show_button.center)
+	assert view.selected == 8
+	view.select_person(7)
+	view.select_person(-1)
+	assert view.selected == 7 and view.person_error
+	view.select_person(view.engine.people)
+	assert view.selected == 7 and view.person_error
 
 
 def test_jump_skips_forward_but_never_back():
-	view = Visualizer(build())
+	view = Visualizer(build(players=[scripted()] * 4))
 	view.jump_to(25)
 	assert view.engine.round == 25
 	view.jump_to(10)
@@ -91,6 +93,7 @@ def test_jump_skips_forward_but_never_back():
 
 def test_typing_a_round_number_jumps():
 	view = Visualizer(build())
+	view.type_key(pygame.K_g, 'g')
 	for ch in '12':
 		view.type_key(0, ch)
 	view.type_key(pygame.K_RETURN, '\r')
@@ -127,11 +130,12 @@ def test_skip_input_ignores_nondecimal_digits():
 
 def test_skip_input_backspace_and_length_limit():
 	view = Visualizer(build())
-	for digit in '1234567':
+	view.input_focus = 'round'
+	for digit in '1234567890':
 		view.type_key(0, digit)
-	assert view.goto_buffer == '123456'
+	assert view.goto_buffer == '123456789'
 	view.type_key(pygame.K_BACKSPACE, '')
-	assert view.goto_buffer == '12345'
+	assert view.goto_buffer == '12345678'
 
 
 @pytest.mark.parametrize('quit_key', [pygame.K_q, pygame.K_ESCAPE, None])
@@ -155,7 +159,7 @@ def test_real_event_loop_controls_and_partial_log(tmp_path, monkeypatch, quit_ke
 				key(pygame.K_RIGHT),
 				key(pygame.K_UP),
 				key(pygame.K_DOWN),
-				pygame.event.Event(pygame.MOUSEBUTTONDOWN, button=1, pos=(100, 100)),
+				pygame.event.Event(pygame.MOUSEBUTTONDOWN, button=1, pos=(760, 100)),
 			],
 			[key(pygame.K_3, '3'), key(pygame.K_RETURN, '\r')],
 			[key(pygame.K_SPACE)],
@@ -187,3 +191,185 @@ def test_leaderboard_draws_and_closes():
 	board.update([row], 2, [])
 	board.wait_to_close()
 	assert not board.open
+
+
+def test_worker_gui_keeps_processing_controls_during_slow_round(tmp_path, monkeypatch):
+	import time
+
+	from core.gui_worker import SimulationWorker
+	from tests.fixtures.worker_players import SlowPlayer
+	from ui.gui import run_gui
+
+	worker = SimulationWorker(
+		dict(players=[SlowPlayer] * 2, rounds=3, timeout=0), str(tmp_path / 'responsive.log')
+	)
+	position = Visualizer(Engine([SlowPlayer] * 2, rounds=3, timeout=0)).person_box.center
+	draws = []
+	original_draw = Visualizer.draw
+
+	def draw(self, surface):
+		draws.append((self.engine.round, self.selected, self.speed, self.jump_target))
+		original_draw(self, surface)
+
+	monkeypatch.setattr(Visualizer, 'draw', draw)
+	started = False
+	pending_frames = 0
+	deadline = time.monotonic() + 15
+
+	def key(k, u=''):
+		return pygame.event.Event(pygame.KEYDOWN, key=k, unicode=u)
+
+	def events():
+		nonlocal started, pending_frames
+		assert time.monotonic() < deadline
+		if worker.ready and not started:
+			started = True
+			return [key(pygame.K_RIGHT)]
+		if worker.pending:
+			pending_frames += 1
+			if pending_frames == 1:
+				return [key(pygame.K_g, 'g'), key(pygame.K_2, '2'), key(pygame.K_RETURN, '\r')]
+			if pending_frames == 2:
+				return [
+					key(pygame.K_SPACE),
+					key(pygame.K_UP),
+					pygame.event.Event(pygame.MOUSEBUTTONDOWN, button=1, pos=position),
+				]
+		if started and not worker.pending:
+			return [pygame.event.Event(pygame.QUIT)]
+		return []
+
+	monkeypatch.setattr(pygame.event, 'get', events)
+	try:
+		run_gui(worker=worker)
+	finally:
+		worker.close()
+	assert pending_frames >= 5
+	assert (0, 0, 4, None) in draws  # controls handled before the round finishes
+	assert not worker.process.is_alive()
+	import json
+
+	result = json.loads((tmp_path / 'responsive.log').read_text().split('========\n', 1)[1])
+	assert result['rounds_played'] == 1  # canceling skip did not queue round 2
+
+
+def test_event_loop_reuses_unchanged_frames(tmp_path, monkeypatch):
+	from ui.gui import run_gui
+
+	drawn = []
+	original = Visualizer.draw
+
+	def draw(self, surface):
+		drawn.append(self.render_key())
+		original(self, surface)
+
+	monkeypatch.setattr(Visualizer, 'draw', draw)
+	frames = iter(
+		[
+			[],
+			[],
+			[pygame.event.Event(pygame.KEYDOWN, key=pygame.K_UP, unicode='')],
+			[],
+			[pygame.event.Event(pygame.QUIT)],
+		]
+	)
+	monkeypatch.setattr(pygame.event, 'get', lambda: next(frames))
+	run_gui(build())
+	assert len(drawn) == 2
+
+
+def test_all_final_happiness_values_are_explicit(screen, monkeypatch):
+	from tests.fixtures.scripted import propose_when_allowed
+
+	for player, rounds in ((scripted(), 1), (scripted(decide=propose_when_allowed), 2)):
+		engine = build(players=[player] * 4, rounds=rounds)
+		engine.run()
+		view = Visualizer(engine)
+		written = []
+		original = view.text
+
+		def text(surface, value, *args, written=written, original=original, **kwargs):
+			written.append(str(value))
+			return original(surface, value, *args, **kwargs)
+
+		monkeypatch.setattr(view, 'text', text)
+		for person in range(engine.people):
+			view.select_person(person)
+			written.clear()
+			view.draw(screen)
+			assert f'{engine.happiness(person):,.2f}' in written
+			assert 'Happiness' in written
+
+
+def test_profile_and_history_navigation(screen):
+	view = Visualizer(build(players=[scripted()] * 4, dims=30, rounds=16))
+	view.jump_to(16)
+	assert len(view.history()) == 16
+	view.scroll_history(100)
+	assert view.history_offset == 4
+	view.select_at((view.history_area.x + 10, view.history_area.y + 10))
+	assert view.history_selected == 4
+	view.type_key(pygame.K_PAGEDOWN, '')
+	assert view.profile_offset == 8
+	view.draw(screen)
+	view.select_person(1)
+	assert view.profile_offset == view.history_offset == 0
+
+
+def test_date_story_explains_actions_and_pairing():
+	from types import SimpleNamespace
+
+	from models.player import Decision
+	from ui.gui import decision_text, pairing_text, result_text
+
+	assert decision_text(Decision()) == 'Took no action.'
+	assert 'Proposed marriage' in decision_text(Decision(again=True, propose=True))
+	assert 'incompatible' in decision_text(Decision(incompatible=True))
+	assert 'Both listed' in pairing_text('mutual')
+	assert 'Only one listed' in pairing_text('one-sided')
+	assert 'Neither listed' in pairing_text('random')
+	assert 'previous date' in pairing_text('repeat')
+	entry = SimpleNamespace(
+		married=False, again=False, decision=Decision(), partner_decision=Decision(again=True)
+	)
+	assert 'Only one asked again' in result_text(entry)
+	assert 'simulation ended' in result_text(entry, ended=True)
+	entry.partner_decision = Decision(propose=True)
+	assert 'Only one proposed' in result_text(entry)
+	entry.partner_decision = Decision(incompatible=True)
+	assert 'never be paired' in result_text(entry)
+	entry.married = True
+	assert 'married and left' in result_text(entry)
+
+
+def test_trait_penalty_colors():
+	from ui.gui import GOOD, penalty_color, trait_penalty
+
+	assert trait_penalty(8, 4, True) == 0
+	assert trait_penalty(2, 4, True) == 4
+	assert trait_penalty(8, 4, False) == 16
+	assert penalty_color(0) == GOOD
+	assert penalty_color(1) != penalty_color(100)
+	assert penalty_color(100) == penalty_color(200)
+
+
+def test_profile_switches_from_date_to_true_spouse(screen):
+	view = Visualizer(build())
+	view.advance()
+	written = []
+	original = view.text
+
+	def capture(surface, value, *args, **kwargs):
+		written.append(str(value))
+		return original(surface, value, *args, **kwargs)
+
+	view.text = capture
+	view.draw(screen)
+	assert 'Shown' in written and 'seen' in written
+	assert 'Round 1 · Partner 17' in written
+	view.jump_to(20)
+	written.clear()
+	view.draw(screen)
+	assert 'Married partner 12' in written
+	assert 'wants' in written and 'true' in written
+	assert 'Shown' not in written
